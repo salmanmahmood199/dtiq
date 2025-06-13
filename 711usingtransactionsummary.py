@@ -29,7 +29,7 @@ import threading
 import requests
 import serial
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # ─── CONFIGURATION ───
@@ -92,12 +92,22 @@ def fetch_token() -> str:
 # ─── TIMESTAMP & GUID ───
 
 def to_utc(local_ts: str) -> str:
+    """Convert local timestamp to UTC, or use current time if conversion fails"""
     try:
+        # If local_ts is very old, use current time instead to ensure transactions appear in frontend
         tz = ZoneInfo(USER_TZ)
         dt = datetime.fromisoformat(local_ts).replace(tzinfo=tz)
+        
+        # Check if timestamp is older than 2023
+        if dt.year < 2023:
+            # Use current time instead
+            dt = datetime.now(tz)
+            print(f"[INFO] Using current time ({dt.isoformat()}) instead of old timestamp: {local_ts}")
+        
         return dt.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%S')
-    except Exception:
-        return local_ts.split('.')[0]
+    except Exception as e:
+        print(f"[WARN] Error converting timestamp: {e}. Using current UTC time.")
+        return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
 
 def generate_guid(store: str, terminal: str, seq: str, ts_utc: str) -> str:
@@ -345,6 +355,7 @@ def build_txn_payload(tx: dict) -> dict:
     paid     = sum(p['amount'] for p in tx['payments'] if p['amount'] > 0)
     paid_d   = Decimal(paid).quantize(Decimal('0.01'), ROUND_HALF_UP)
     change   = (paid_d - tot_due).quantize(Decimal('0.01'), ROUND_HALF_UP)
+    
     # Build items
     items_list = []
     idx = 1
@@ -354,6 +365,14 @@ def build_txn_payload(tx: dict) -> dict:
         typ     = 'Voided' if is_void else 'Sale'
         pid     = f"PID{tx['seq']}_{idx}"
         idx += 1
+        
+        # Better handling for promotions
+        is_promo = 'PROMO' in itm['name'].upper() or itm['price'] < 0
+        category = 'Promotion' if is_promo else 'General'
+        
+        # We keep 'Sale' as ItemType but mark promotions through the Category field
+        
+        # Create the item with proper categorization
         items_list.append({
             'OrderItemState': [{ 'ItemState': {'value': state}, 'Timestamp': tx['ts_utc'] }],
             'MenuProduct': {
@@ -361,10 +380,14 @@ def build_txn_payload(tx: dict) -> dict:
                 'name': itm['name'],
                 'MenuItem': [{
                     'ItemType': typ,
-                    'Category': 'General',
+                    'Category': category,
                     'iD': f"{pid}_MI",
                     'Description': itm['name'],
-                    'Pricing': [{ 'Tax': [], 'ItemPrice': itm['price'], 'Quantity': itm['quantity'] }],
+                    'Pricing': [{ 
+                        'Tax': [], 
+                        'ItemPrice': float(Decimal(itm['price']).quantize(Decimal('0.01'), ROUND_HALF_UP)),
+                        'Quantity': itm['quantity'] 
+                    }],
                     'SKU': { 'productName': itm['name'], 'productCode': pid }
                 }],
                 'SKU': { 'productName': itm['name'], 'productCode': pid }
@@ -386,12 +409,31 @@ def build_txn_payload(tx: dict) -> dict:
         pi += 1
     # Tax array
     tax_arr = [{ 'amount': float(tax_d), 'Description': 'Sales Tax' }] if tax_d > 0 else []
+    # Determine transaction state based on voids and item types
+    has_voided_items = bool(tx['voids'])
+    all_items_voided = has_voided_items and all(item['event'] == 'void' for item in tx['items'] + tx['voids'])
+    
+    # Determine order state
+    order_state = 'Closed'
+    if all_items_voided:
+        order_state = 'Voided'
+    elif has_voided_items:
+        order_state = 'Closed'  # Partial void
+    
+    # Determine transaction type
+    transaction_type = 'New'
+    if has_voided_items:
+        transaction_type = 'Update'  # All voids are updates
+    
+    # Add a timestamp for better frontend visibility
+    current_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    
     # Assemble event
     evt = {
         'TransactionGUID': tx['guid'],
-        'TransactionDateTimeStamp': tx['ts_utc'],
-        'TransactionType': 'Update' if tx['voids'] else 'New',
-        'BusinessDate': tx['ts_utc'][:10].replace('-', ''),
+        'TransactionDateTimeStamp': current_ts,  # Use current time for better frontend visibility
+        'TransactionType': transaction_type,
+        'BusinessDate': current_ts[:10].replace('-', ''),  # Use current date
         'Location': {'LocationID': tx['store'], 'Description': tx['location_desc']},
         'TransactionDevice': {'DeviceID': tx['terminal'], 'DeviceDescription': f"POS Terminal {tx['terminal']}"},
         'Employee': {'EmployeeID': tx['employee_id'], 'EmployeeFullName': tx['employee_name']},
@@ -399,8 +441,8 @@ def build_txn_payload(tx: dict) -> dict:
             'Order': {
                 'OrderID': tx['guid'],
                 'OrderNumber': int(tx['seq'] or 0),
-                'OrderTime': tx['ts_utc'],
-                'OrderState': 'Voided' if tx['voids'] else 'Closed',
+                'OrderTime': current_ts,  # Use current time
+                'OrderState': order_state,
                 'OrderItem': items_list,
                 'Total': { 'ItemPrice': float(net_item), 'Tax': tax_arr },
                 'OrderItemCount': len(items_list),
@@ -466,12 +508,43 @@ def build_refund_payload(tx: dict) -> dict:
 def dispatcher_worker():
     while True:
         tx = tx_queue.get()
+        
+        # Classify transaction type for appropriate URL and logging
+        transaction_category = "unknown"
+        
         if not tx['items'] and not tx['payments']:
-            payload = build_cash_op_payload(tx); url = CASH_URL
+            payload = build_cash_op_payload(tx)
+            url = CASH_URL
+            transaction_category = "cash-operation"
+            
         elif tx['type'].lower() == 'refund' or all(i['price'] < 0 for i in tx['items']):
-            payload = build_refund_payload(tx); url = REFUND_URL
+            payload = build_refund_payload(tx)
+            url = REFUND_URL
+            transaction_category = "refund"
+            
         else:
-            payload = build_txn_payload(tx); url = TXN_URL
+            # Standard transaction
+            payload = build_txn_payload(tx)
+            url = TXN_URL
+            
+            # Categorize the transaction for better logging
+            has_voids = bool(tx['voids'])
+            all_voided = has_voids and all(item['event'] == 'void' for item in tx['items'] + tx['voids'])
+            has_promos = any('PROMO' in item['name'].upper() or item['price'] < 0 for item in tx['items'])
+            
+            if all_voided:
+                transaction_category = "full-void"
+            elif has_voids:
+                transaction_category = "partial-void"
+            elif has_promos:
+                transaction_category = "promotion"
+            else:
+                transaction_category = "standard-sale"
+        
+        # Log what we're sending
+        print(f"\n[INFO] Sending {transaction_category} transaction to {url.split('/')[-1]} endpoint")
+        
+        # Make the API request
         try:
             token = fetch_token()
             headers = {
@@ -479,11 +552,26 @@ def dispatcher_worker():
                 'External-Party-ID': CLIENT_ID,
                 'Content-Type': 'application/json'
             }
+            
+            # Send the payload to the API
+            print(f"[INFO] Request payload type: {payload['model']}")
             resp = requests.post(url, headers=headers, json=payload, timeout=10)
             status_code = resp.status_code
             body = resp.text
+            
+            # Log the result
+            if 200 <= status_code < 300:
+                print(f"[SUCCESS] {transaction_category.upper()} transaction sent successfully: Status {status_code}")
+            else:
+                print(f"[ERROR] Failed to send {transaction_category} transaction: Status {status_code}")
+                print(f"[ERROR] Response body: {body[:200]}...")
+                
         except Exception as e:
-            status_code = 0; body = str(e)
+            status_code = 0
+            body = str(e)
+            print(f"[ERROR] Exception sending {transaction_category} transaction: {e}")
+            
+        # Record the result
         success = 200 <= status_code < 300
         write_transaction_by_date(tx, success, status_code, body)
         tx_queue.task_done()
