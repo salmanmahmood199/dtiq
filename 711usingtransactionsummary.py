@@ -370,7 +370,14 @@ def build_txn_payload(tx: dict) -> dict:
         is_promo = 'PROMO' in itm['name'].upper() or itm['price'] < 0
         category = 'Promotion' if is_promo else 'General'
         
-        # We keep 'Sale' as ItemType but mark promotions through the Category field
+        # For promotions with positive prices, convert to negative
+        item_price = itm['price']
+        if is_promo and item_price > 0 and not is_void:
+            # Make it negative for proper promotion handling
+            item_price = -abs(item_price)
+            print(f"[INFO] Converting positive promotion price to negative: {itm['name']} from ${itm['price']} to ${item_price}")
+        else:
+            item_price = itm['price']
         
         # Create the item with proper categorization
         items_list.append({
@@ -385,7 +392,7 @@ def build_txn_payload(tx: dict) -> dict:
                     'Description': itm['name'],
                     'Pricing': [{ 
                         'Tax': [], 
-                        'ItemPrice': float(Decimal(itm['price']).quantize(Decimal('0.01'), ROUND_HALF_UP)),
+                        'ItemPrice': float(Decimal(item_price).quantize(Decimal('0.01'), ROUND_HALF_UP)),
                         'Quantity': itm['quantity'] 
                     }],
                     'SKU': { 'productName': itm['name'], 'productCode': pid }
