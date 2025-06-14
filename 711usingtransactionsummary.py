@@ -333,6 +333,59 @@ def parser_worker():
                 try:
                     val = float(val_str)
                 except:
+                    val = 0.0  # Default to zero if conversion fails
+                smap[key] = val
+            buf['summary_map'] = smap
+            
+            # Process EndTransaction
+            meta = buf['meta'] or {}
+            ts_local = meta.get('timeStamp', rec.get('timestamp', ''))
+            if not ts_local:
+                now = datetime.now()
+                ts_local = now.strftime("%Y-%m-%dT%H:%M:%S")
+            ts_utc = to_utc(ts_local)
+            terminal = meta.get('terminalId', port[-1])
+            seq = meta.get('sequenceNumber', '0')
+            store = meta.get('storeId', '1001')  # Force to valid test store in UAT env
+            guid = generate_guid(store, terminal, seq, ts_utc)
+            
+            # Check if this is a refund transaction
+            is_refund = False
+            # Check if any items have negative price (refund indicator)
+            if any(item['price'] < 0 for item in buf['items']):
+                is_refund = True
+            # Check refund in operation field
+            if buf.get('operation', '').lower() == 'refund':
+                is_refund = True
+            # Check refund in metadata
+            if meta.get('transactionType', '').lower() == 'refund':
+                is_refund = True
+                
+            # Determine transaction type
+            tx_type = 'refund' if is_refund else 'standard-sale'
+            if buf.get('operation', '').lower() in ['nosale', 'paidout', 'cashdrop']:
+                tx_type = 'cash-operation'
+                
+            # Create transaction object
+            tx = {
+                'guid': guid, 
+                'seq': seq, 
+                'type': tx_type,
+                'operation': buf.get('operation', ''),
+                'store': store,
+                'location_desc': 'Windsor Mill 711',  # Hardcoded for UAT
+                'terminal': terminal,
+                'ts_local': ts_local, 
+                'ts_utc': ts_utc,
+                'operator': meta.get('operatorId', ''),
+                'employee_id': meta.get('operatorId', 'OP5'),
+                'employee_name': meta.get('operatorName', 'Operator Five'),
+                'items': buf['items'],
+                'payments': buf['payments'],
+                'summary_map': buf['summary_map'],
+                'voids': buf['voids']
+            }
+            
             save_tx_event(tx)
             tx_queue.put(tx)
             buffers[port] = None
