@@ -314,9 +314,28 @@ def parser_worker():
             pays = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(pays, dict):
                 pays = [pays]
+            
+            # Clear existing payments to avoid duplicates
+            buf['payments'] = []
+            
+            # Extract payment information
             for p in pays:
-                amt = float(p.get('details', '0').replace('$', ''))
-                buf['payments'].append({'amount': amt, 'tenderType': p.get('description', '')})
+                # Only process actual payment entries (those with dollar amounts)
+                if p.get('details', '').startswith('$'):
+                    amt = float(p.get('details', '0').replace('$', ''))
+                    tender_type = p.get('description', '')
+                    
+                    # Store payment info
+                    buf['payments'].append({
+                        'amount': amt, 
+                        'tenderType': tender_type,
+                        'is_cash': tender_type.upper() == 'CASH'
+                    })
+                    
+                    # If it's a cash payment, mark the buffer to look for change in the next transaction summary
+                    if tender_type.upper() == 'CASH':
+                        buf['awaiting_cash_change'] = True
+            
             parser_queue.task_done()
             continue
             
@@ -326,17 +345,42 @@ def parser_worker():
             summ = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(summ, dict):
                 summ = [summ]
-            buf['summary_list'] = summ
-            smap = {}
-            for e in summ:
-                key = e.get('description', '').upper().strip()
-                val_str = e.get('details', '').replace('$', '').replace(',', '').strip()
-                try:
-                    val = float(val_str)
-                except:
-                    val = 0.0  # Default to zero if conversion fails
-                smap[key] = val
-            buf['summary_map'] = smap
+            
+            # If this is the first summary, store it
+            if not buf.get('summary_list'):
+                buf['summary_list'] = summ
+                smap = {}
+                for e in summ:
+                    key = e.get('description', '').upper().strip()
+                    val_str = e.get('details', '').replace('$', '').replace(',', '').strip()
+                    try:
+                        val = float(val_str)
+                    except:
+                        val = 0.0  # Default to zero if conversion fails
+                    smap[key] = val
+                buf['summary_map'] = smap
+            # If this is a second transaction summary and we're awaiting change for cash payment
+            elif buf.get('awaiting_cash_change', False):
+                print(f"[INFO] Processing second transaction summary for cash change")
+                for e in summ:
+                    key = e.get('description', '').upper().strip()
+                    if key == 'CHANGE':
+                        val_str = e.get('details', '').replace('$', '').replace(',', '').strip()
+                        try:
+                            change_amount = float(val_str)
+                            # Update the cash payment with the change amount
+                            for payment in buf['payments']:
+                                if payment.get('is_cash', False):
+                                    payment['change'] = change_amount
+                                    print(f"[INFO] Updated cash payment with change amount: ${change_amount}")
+                                    break
+                        except:
+                            print(f"[ERROR] Failed to parse change amount: {val_str}")
+                # Reset the flag
+                buf['awaiting_cash_change'] = False
+                
+                # Don't overwrite the first transaction summary
+                # buf['summary_map'] stays as is
             
             # Process EndTransaction
             meta = buf['meta'] or {}
@@ -508,18 +552,22 @@ def build_txn_payload(tx: dict) -> dict:
         })
     # Build payments
     payments = []
-    pi = 0
     for p in tx['payments']:
         amt = Decimal(p['amount']).quantize(Decimal('0.01'), ROUND_HALF_UP)
         if amt == 0:
             continue
-        ch = float(change) if pi == 0 else 0.0
+        
+        # Use the change amount directly from the payment if available
+        # This comes from the second transaction summary for cash payments
+        change_amt = Decimal(p.get('change', 0.0)).quantize(Decimal('0.01'), ROUND_HALF_UP)
+        
         payments.append({
-            'Timestamp': tx['ts_utc'], 'Status': 'Accepted' if amt >= 0 else 'Denied',
-            'Amount': float(amt), 'Change': ch,
+            'Timestamp': tx['ts_utc'], 
+            'Status': 'Accepted' if amt >= 0 else 'Denied',
+            'Amount': float(amt), 
+            'Change': float(change_amt),
             'TenderType': {'value': map_tender(p['tenderType'])}
         })
-        pi += 1
         
     # If no payments were found, add a default cash payment equal to the total due
     # This is required as the API validation requires at least one payment
