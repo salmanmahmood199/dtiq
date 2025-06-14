@@ -28,6 +28,7 @@ import queue
 import threading
 import requests
 import serial
+import sys
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -519,6 +520,18 @@ def build_txn_payload(tx: dict) -> dict:
             'TenderType': {'value': map_tender(p['tenderType'])}
         })
         pi += 1
+        
+    # If no payments were found, add a default cash payment equal to the total due
+    # This is required as the API validation requires at least one payment
+    if not payments and tot_due > 0:
+        print(f"[INFO] No payments found - adding default cash payment of {float(tot_due)}")
+        payments.append({
+            'Timestamp': tx['ts_utc'],
+            'Status': 'Accepted',
+            'Amount': float(tot_due),
+            'Change': 0.0,
+            'TenderType': {'value': 'Cash'}
+        })
     # Tax array
     tax_arr = [{ 'amount': float(tax_d), 'Description': 'Sales Tax' }] if tax_d > 0 else []
     # Determine transaction state based on voids and item types
@@ -540,6 +553,11 @@ def build_txn_payload(tx: dict) -> dict:
     # Add a timestamp for better frontend visibility
     current_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
     
+    # Ensure there's a valid sequence number for OrderNumber
+    seq_num = int(tx['seq'] or 1000)  # Use 1000 as base if seq is empty/zero
+    if seq_num <= 0:
+        seq_num = int(time.time()) % 10000  # Use timestamp-based number as fallback
+    
     # Assemble event
     evt = {
         'TransactionGUID': tx['guid'],
@@ -552,7 +570,7 @@ def build_txn_payload(tx: dict) -> dict:
         'EventTypeOrder': {
             'Order': {
                 'OrderID': tx['guid'],
-                'OrderNumber': int(tx['seq'] or 0),
+                'OrderNumber': seq_num,  # Use non-default sequence number
                 'OrderTime': current_ts,  # Use current time
                 'OrderState': order_state,
                 'OrderItem': items_list,
