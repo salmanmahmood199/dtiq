@@ -210,6 +210,54 @@ def parser_worker():
     while True:
         port, rec = parser_queue.get()
         cmd = rec.get('CMD')
+        
+        # Handle cash operations (no-sale, paid-out, cash-drop)
+        # These come in as direct commands, not part of a transaction
+        if cmd in ['NoSale', 'PaidOut', 'CashDrop']:
+            # Map the command to operation type
+            operation_type = cmd.lower()  # Convert to lowercase for consistency
+            
+            # Get timestamp or use current time
+            ts_local = rec.get('datetime', '')
+            if not ts_local:
+                now = datetime.now()
+                ts_local = now.strftime("%Y-%m-%dT%H:%M:%S")
+            ts_utc = to_utc(ts_local)
+            
+            # Get terminal, sequence, and amount info
+            terminal = rec.get('terminal', port[-1])
+            seq = rec.get('sequence', '0')
+            amount = rec.get('amount', 0.0)
+            store = '1001'  # Force to valid test store in UAT env
+            guid = generate_guid(store, terminal, seq, ts_utc)
+            
+            # Create transaction object for cash operation
+            tx = {
+                'guid': guid, 
+                'seq': seq, 
+                'type': 'cash-operation',
+                'operation': operation_type,
+                'amount': amount,
+                'store': store,
+                'location_desc': 'Windsor Mill 711',  # Hardcoded for UAT
+                'terminal': terminal,
+                'ts_local': ts_local, 
+                'ts_utc': ts_utc,
+                'operator': rec.get('operator', ''),
+                'employee_id': rec.get('operator', 'OP5'),
+                'employee_name': rec.get('operator', 'Operator Five'),
+                'items': [],
+                'payments': [],
+                'summary_map': {},
+                'voids': []
+            }
+            
+            # Save and queue the transaction
+            save_tx_event(tx)
+            tx_queue.put(tx)
+            parser_queue.task_done()
+            continue
+            
         # StartTransaction
         if cmd == 'StartTransaction':
             buffers[port] = {
@@ -218,19 +266,26 @@ def parser_worker():
                 'voids': [],
                 'payments': [],
                 'summary_list': [],
-                'summary_map': {}
+                'summary_map': {},
+                'operation': rec.get('operation', '')  # Capture operation if present
             }
             parser_queue.task_done()
             continue
+            
         buf = buffers.get(port)
         if buf is None:
             parser_queue.task_done()
             continue
+            
         # metaData
         if rec.get('metaData'):
             buf['meta'] = rec['metaData']
+            # Check if this is a special operation (no-sale, paid-out, cash-drop)
+            if 'operation' in rec['metaData'] and rec['metaData']['operation']:
+                buf['operation'] = rec['metaData']['operation']
             parser_queue.task_done()
             continue
+            
         # cartChangeTrail
         if rec.get('cartChangeTrail') is not None:
             raw = rec['cartChangeTrail']
@@ -251,6 +306,7 @@ def parser_worker():
                 (buf['voids' if entry['event'] == 'void' else 'items']).append(entry)
             parser_queue.task_done()
             continue
+            
         # paymentSummary
         if rec.get('paymentSummary') is not None:
             raw = rec['paymentSummary']
@@ -262,6 +318,7 @@ def parser_worker():
                 buf['payments'].append({'amount': amt, 'tenderType': p.get('description', '')})
             parser_queue.task_done()
             continue
+            
         # transactionSummary
         if rec.get('transactionSummary') is not None:
             raw = rec['transactionSummary']
@@ -276,37 +333,6 @@ def parser_worker():
                 try:
                     val = float(val_str)
                 except:
-                    val = 0.0
-                smap[key] = val
-            buf['summary_map'] = smap
-            parser_queue.task_done()
-            continue
-        # EndTransaction
-        if cmd == 'EndTransaction':
-            m = buf['meta'] or {}
-            ts_loc = m.get('timeStamp', '')
-            ts_utc = to_utc(ts_loc) if ts_loc else ''
-            seq   = str(m.get('transactionSeqNumber', ''))
-            store = '1001'
-            term  = str(m.get('terminalNumber', ''))
-            op    = m.get('operator', '')
-            guid  = generate_guid(store, term, seq, ts_utc)
-            tx = {
-                'guid': guid,
-                'ts_local': ts_loc,
-                'ts_utc': ts_utc,
-                'store': store,
-                'terminal': term,
-                'seq': seq,
-                'type': m.get('transactionType', ''),
-                'items': buf['items'],
-                'voids': buf['voids'],
-                'payments': buf['payments'],
-                'transactionSummary': buf['summary_list'],
-                'summary_map': buf['summary_map'],
-                'employee_id': op,
-                'employee_name': op,
-                'location_desc': f"Store {store}"}
             save_tx_event(tx)
             tx_queue.put(tx)
             buffers[port] = None
@@ -317,26 +343,52 @@ def parser_worker():
 # ─── PAYLOAD BUILDERS ───
 
 def build_cash_op_payload(tx: dict) -> dict:
-    ts = tx['ts_utc']
-    biz = ts[:10].replace('-', '')
-    seq = int(tx['seq'] or 0)
-    return {
+    biz = tx['ts_utc'][:10].replace('-', '')  # Date portion as YYYYMMDD
+    ts  = tx['ts_utc']
+    
+    # Determine cash operation type - default to NoSale if not specified
+    operation_type = 'NoSale'  # Default value
+    
+    # Map operation type from transaction data
+    op = tx.get('operation', '').lower()
+    if op == 'paidout':
+        operation_type = 'PaidOut'
+    elif op == 'cashdrop' or op == 'drop':
+        operation_type = 'Drop'
+    elif op == 'nosale' or not op:
+        operation_type = 'NoSale'
+        
+    # Get amount if present (for PaidOut or Drop operations)
+    amount = tx.get('amount', 0.0)
+    if isinstance(amount, str):
+        try:
+            amount = float(amount)
+        except (ValueError, TypeError):
+            amount = 0.0
+    
+    # Start building the payload
+    cash_op_payload = {
         'model': 'CashOperation',
         'Event': {
             'TransactionGUID': tx['guid'],
             'TransactionDateTimeStamp': ts,
             'TransactionType': 'New',
             'BusinessDate': biz,
-            'Location': {'LocationID': tx['store'], 'Description': tx['location_desc']},
-            'TransactionDevice': {'DeviceID': tx['terminal'], 'DeviceDescription': f"POS Terminal {tx['terminal']}"},
-            'Employee': {'EmployeeID': tx['employee_id'], 'EmployeeFullName': tx['employee_name']},
-            'EventTypeDrawer': {
-                'Drawer': {
-                    'DrawerEventGUID': tx['guid'],
-                    'DrawerEventNumber': seq,
-                    'DrawerOperationType': 'PaidOut',
-                    'DrawerOpenTime': ts,
-                    'CashManagement': [{'Amount': 0.00}]
+            'Location': {
+                'LocationID': tx['store'],
+                'Description': tx['location_desc'],
+            },
+            'TransactionDevice': {
+                'DeviceID': tx['terminal'],
+                'DeviceDescription': f"POS Terminal {tx['terminal']}"
+            },
+            'Employee': {
+                'EmployeeID': tx['employee_id'],
+                'EmployeeFullName': tx['employee_name']
+            },
+            'EventTypeCashOperation':{
+                'CashOperation':{
+                    'CashOperationType': {'value': operation_type},
                 }
             }
         }
@@ -519,25 +571,36 @@ def dispatcher_worker():
         # Classify transaction type for appropriate URL and logging
         transaction_category = "unknown"
         
-        if not tx['items'] and not tx['payments']:
+        # Check if this is a no-sale or cash operation
+        if 'operation' in tx and tx['operation']:
             payload = build_cash_op_payload(tx)
             url = CASH_URL
-            transaction_category = "cash-operation"
+            operation_type = tx.get('operation', '').lower()
             
-        elif tx['type'].lower() == 'refund' or all(i['price'] < 0 for i in tx['items']):
+            if operation_type == 'nosale':
+                transaction_category = "no-sale"
+            elif operation_type == 'paidout':
+                transaction_category = "paid-out"
+            elif operation_type == 'cashdrop':
+                transaction_category = "cash-drop"
+            else:
+                transaction_category = "cash-operation"
+                
+        # Check if this is a refund transaction
+        elif tx['type'].lower() == 'refund' or (tx['items'] and all(i.get('price', 0) < 0 for i in tx['items'])):
             payload = build_refund_payload(tx)
             url = REFUND_URL
             transaction_category = "refund"
             
+        # Standard transaction
         else:
-            # Standard transaction
             payload = build_txn_payload(tx)
             url = TXN_URL
             
             # Categorize the transaction for better logging
             has_voids = bool(tx['voids'])
             all_voided = has_voids and all(item['event'] == 'void' for item in tx['items'] + tx['voids'])
-            has_promos = any('PROMO' in item['name'].upper() or item['price'] < 0 for item in tx['items'])
+            has_promos = any('PROMO' in item['name'].upper() or item.get('price', 0) < 0 for item in tx['items'])
             
             if all_voided:
                 transaction_category = "full-void"
